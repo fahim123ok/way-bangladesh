@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "node banglapath-home/server.js",
     "start": "node banglapath-home/server.js",
+    "postinstall": "npm run build",
     "build": "npm run build --workspace=book && npm run build --workspace=\"Hospital finding\" && node -e \"const fs=require('fs'); for (const file of ['book/dist/index.html','Hospital finding/dist/index.html']) { if (!fs.existsSync(file)) throw new Error('Missing deployment build: '+file); } console.log('Standalone app builds verified.');\"",
     "lint": "node --check banglapath-home/server.js && node --check banglapath-home/modules.js && node --check banglapath-home/home.js && node --check banglapath-home/script.js && node --check banglapath-home/config.js"
   },
