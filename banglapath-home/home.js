@@ -965,18 +965,19 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
   }
 
   function askAboutPin(pin, place) {
+    const resolvedPlace = place || byId.get(pin.id);
     if (busy) {
-      queuePinRequest(pin, place);
+      queuePinRequest(pin, resolvedPlace);
       showToast('I will explain that pin next...');
       return;
     }
     document.querySelectorAll('.pin').forEach((el) => el.classList.remove('is-active'));
     document.querySelector(`.pin[data-id="${pin.id}"]`)?.classList.add('is-active');
     openChat();
-    const label = pin.label || pin.name || (place && place.name) || 'this destination';
-    const name = place ? `${place.name}, ${place.district}` : label;
+    const label = pin.label || pin.name || (resolvedPlace && resolvedPlace.name) || 'this destination';
+    const name = resolvedPlace ? `${resolvedPlace.name}, ${resolvedPlace.district}` : label;
     send(
-      `I just tapped the map pin on ${label}${place ? ` (${name})` : ''}. Explain this place to me like a friendly local guide: why a tourist must see it, what I will experience there, the best things to do, the best time to visit, and one important travel tip.`,
+      `I just tapped the map pin on ${label}${resolvedPlace ? ` (${name})` : ''}. Explain this place to me like a friendly local guide: why a tourist must see it, what I will experience there, the best things to do, the best time to visit, and one important travel tip.`,
       { display: `Tell me about ${label} 📍` }
     );
   }
@@ -8545,7 +8546,9 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
           `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.6c-4.1 0-7.4 3.3-7.4 7.4 0 5.3 6.5 12.6 6.8 12.9a.8.8 0 0 0 1.2 0c.3-.3 6.8-7.6 6.8-12.9 0-4.1-3.3-7.4-7.4-7.4z"/><circle cx="12" cy="9" r="2.7" fill="#fff" stroke="none"/></svg>` +
           `<span class="mh-pin-tooltip">${mhEsc(label)}</span>`;
 
-        btn.addEventListener('click', () => {
+        btn.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
           // Deactivate all pins
           frame.querySelectorAll('.mh-pin').forEach((el) => el.classList.remove('is-active'));
           btn.classList.add('is-active');
@@ -8657,12 +8660,13 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
 
     const _origSend = send;
 
-    let mobilePendingRequest = null;
+    const mobilePendingRequests = [];
 
     async function mobileSend(text, opts) {
       if (!text.trim()) return;
       if (busy) {
-        mobilePendingRequest = { text, opts };
+        mobilePendingRequests.push({ text, opts });
+        showToast('I am still answering. Your pin is queued next...');
         return;
       }
       const displayText = (opts && opts.display) ? opts.display : text;
@@ -8694,9 +8698,8 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
         busy = false;
         const sendBtn = document.querySelector('.mh-send-btn');
         if (sendBtn) sendBtn.disabled = false;
-        if (mobilePendingRequest) {
-          const nextRequest = mobilePendingRequest;
-          mobilePendingRequest = null;
+        if (mobilePendingRequests.length) {
+          const nextRequest = mobilePendingRequests.shift();
           window.setTimeout(() => mobileSend(nextRequest.text, nextRequest.opts), 80);
         }
       }
@@ -8877,6 +8880,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     // ---- Render pins ----
 
     renderMobilePins();
+    ready.then(() => renderMobilePins()).catch(() => {});
   }
 
   return { enterHome, send, openPlace };

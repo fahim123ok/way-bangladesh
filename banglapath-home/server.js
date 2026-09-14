@@ -51,6 +51,8 @@ const FALLBACK_GEMINI_API_KEY = process.env.GEMINI_API_KEY_FALLBACK || 'SET_GEMI
 const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim() || (process.env.GEMINI_API_KEY_FALLBACK || '').trim() || FALLBACK_GEMINI_API_KEY.trim();
 const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
 const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+const isQuotaFailure = (status, message = '') =>
+  status === 429 || (status === 403 && /quota|rate.?limit|resource.?exhausted|billing/i.test(message));
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -298,6 +300,8 @@ KNOWLEDGE SCOPE:
 
   // Product behavior: Groq is the main provider for everyday answers. If it is
   // rate-limited, down, or fails, Gemini automatically takes over as fallback.
+  let groqFailure = '';
+  let groqQuotaLimited = false;
   if (GROQ_API_KEY) {
     try {
       const groqMessages = [
@@ -323,23 +327,36 @@ KNOWLEDGE SCOPE:
       if (groqResponse.ok) {
         const out = readGroqReply(groqRaw);
         if (out.reply) return json(res, 200, { reply: out.reply, places: out.places.slice(0, 2), sources: [] });
-      } else if (process.env.NODE_ENV !== 'production') {
-        console.error(`[chat] Groq ${groqResponse.status}: ${groqRaw.slice(0, 240)}`);
+        groqFailure = 'Groq returned an empty reply.';
+      } else {
+        groqQuotaLimited = isQuotaFailure(groqResponse.status, groqRaw);
+        groqFailure = groqQuotaLimited
+          ? 'Groq is out of quota or rate-limited.'
+          : `Groq failed with HTTP ${groqResponse.status}.`;
+        if (process.env.NODE_ENV !== 'production') {
+          console.error(`[chat] Groq ${groqResponse.status}: ${groqRaw.slice(0, 240)}`);
+        }
       }
     } catch (err) {
+      groqFailure = `Groq unavailable: ${err.message}`;
       if (process.env.NODE_ENV !== 'production') console.error(`[chat] Groq unavailable: ${err.message}`);
     }
   }
 
   const key = GEMINI_API_KEY || '';
   if (!key || key === 'SET_GEMINI_KEY_IN_RENDER_ENV') {
-    return json(res, 503, { error: 'Groq was unavailable and GEMINI_API_KEY is not configured for fallback.' });
+    return json(res, 503, {
+      error: groqQuotaLimited
+        ? 'Both AI providers are unavailable: Groq is out of quota, and Gemini is not configured.'
+        : `Groq was unavailable${groqFailure ? ` (${groqFailure})` : ''}, and Gemini is not configured for fallback.`,
+    });
   }
 
   // Overload, rate limits and empty candidates are all transient, and a chat
   // bubble that says "502" is useless to a traveller — work down the models
   // before giving up.
   let last = 'Gemini did not answer.';
+  let geminiQuotaLimited = false;
   const deadline = Date.now() + 90000;
   const uniqueModels = [...new Set(MODELS)];
   for (let attempt = 0; attempt < uniqueModels.length; attempt += 1) {
@@ -383,8 +400,9 @@ KNOWLEDGE SCOPE:
         /* keep the raw snippet */
       }
       if (process.env.NODE_ENV !== 'production') console.error(`[chat] ${model} ${upstream.status}: ${message.split('\n')[0]}`);
+      if (isQuotaFailure(upstream.status, message)) geminiQuotaLimited = true;
       last =
-        upstream.status === 429
+        isQuotaFailure(upstream.status, message)
           ? 'The Gemini key has run out of free quota for now — try again in a minute.'
           : `Gemini said: ${message}`;
       if (upstream.status === 429 && !needsWebSearch) break;
@@ -409,7 +427,11 @@ KNOWLEDGE SCOPE:
   }
 
   // All models failed - return error so client shows proper error message
-  return json(res, 503, { error: last || 'AI service temporarily unavailable. Please try again in a moment.' });
+  return json(res, 503, {
+    error: groqQuotaLimited && geminiQuotaLimited
+      ? 'Both AI providers are out of quota right now. Groq and Gemini could not answer this request.'
+      : last || 'AI service temporarily unavailable. Please try again in a moment.',
+  });
 }
 
 const TRANSLATE_CACHE = new Map();
