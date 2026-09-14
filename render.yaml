@@ -3,6 +3,6 @@ services:
     name: banglapath
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: node banglapath-home/server.js
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm start
     healthCheckPath: /
