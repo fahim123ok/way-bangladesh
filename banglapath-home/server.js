@@ -1,0 +1,726 @@
+/* Static file server + Gemini proxy for Way Bangladesh.
+ *
+ * Run:  GEMINI_API_KEY=... node server.js
+ * The key stays in this process; the browser only ever calls POST /api/chat.
+ */
+
+const http = require('http');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+
+const ROOT = __dirname;
+const BOOK_DIST = path.resolve(ROOT, '../book/dist');
+const HOSP_DIST = path.resolve(ROOT, '../Hospital finding/dist');
+const PORT = Number(process.env.PORT) || 3000;
+
+/*
+ * Use a supported Gemini model set and keep the list compatible with the
+ * current Google AI API. Groq remains the primary provider for everyday chat,
+ * while Gemini is the automatic fallback when Groq is rate-limited or down.
+ */
+const MODELS = [
+  ...(process.env.GEMINI_MODEL ? [process.env.GEMINI_MODEL] : []),
+  'gemini-3.6-flash',
+  'gemini-2.5-flash',
+  'gemini-3.5-flash-lite',
+].filter((m, i, all) => !!m && all.indexOf(m) === i);
+
+// Thinking is configured differently across generations, and both families
+// otherwise burn the whole output budget before writing a word.
+const thinkingFor = (model) =>
+  model.startsWith('gemini-3') ? { thinkingLevel: 'low' } : undefined;
+
+const supportsGoogleSearch = (model) =>
+  model.startsWith('gemini-2.5') || model.startsWith('gemini-2.0') || model.startsWith('gemini-3');
+
+// Load a local .env if present, so `node server.js` just works.
+for (const envPath of [path.join(ROOT, '.env'), path.join(process.cwd(), '.env')]) {
+  try {
+    for (const line of fs.readFileSync(envPath, 'utf8').split('\n')) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*)\s*$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2].replace(/^["']|["']$/g, '');
+    }
+  } catch {
+    /* no .env, fall back to the ambient environment */
+  }
+}
+
+// Read the key after loading the local environment file.
+const FALLBACK_GEMINI_API_KEY = process.env.GEMINI_API_KEY_FALLBACK || 'SET_GEMINI_KEY_IN_RENDER_ENV';
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || '').trim() || (process.env.GEMINI_API_KEY_FALLBACK || '').trim() || FALLBACK_GEMINI_API_KEY.trim();
+const GROQ_API_KEY = (process.env.GROQ_API_KEY || '').trim();
+const GROQ_MODEL = process.env.GROQ_MODEL || 'qwen/qwen3.8-27b';
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.mp4': 'video/mp4',
+  '.woff2': 'font/woff2',
+  '.ico': 'image/x-icon',
+};
+
+const RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    reply: { type: 'string' },
+    places: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['reply'],
+};
+
+/* The model answers in JSON, but a truncated or half-written answer still
+ * contains a usable sentence. Pull the "reply" string out by hand rather than
+ * dropping the turn or showing the user raw braces. */
+function salvage(text) {
+  const m = text.match(/"reply"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (!m) return text.startsWith('{') ? '' : text;
+  try {
+    return JSON.parse(`"${m[1].replace(/\\?$/, '')}"`);
+  } catch {
+    return m[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+  }
+}
+
+function cleanReplyText(text) {
+  return String(text || '')
+    .replace(/\n\s*(?:\*{0,2})?(?:clickable sources|sources)(?:\*{0,2})\s*:\s*[\s\S]*$/i, '')
+    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1')
+    .trim();
+}
+
+let placesCatalog = [];
+try {
+  const pData = JSON.parse(fs.readFileSync(path.join(ROOT, 'places.json'), 'utf8'));
+  placesCatalog = Array.isArray(pData.places) ? pData.places : [];
+} catch (err) {
+  if (process.env.NODE_ENV !== 'production') console.warn('Could not preload places.json:', err.message);
+}
+
+function readReply(raw) {
+  const data = JSON.parse(raw);
+  const cand = data.candidates?.[0];
+  const grounding = cand?.groundingMetadata || data.groundingMetadata || {};
+  const sources = (grounding.groundingChunks || [])
+    .map((chunk) => chunk.web)
+    .filter((web) => web && /^https?:\/\//i.test(web.uri || ''))
+    .map((web) => ({ title: String(web.title || web.uri), uri: web.uri }))
+    .filter((source, index, all) => all.findIndex((item) => item.uri === source.uri) === index)
+    .slice(0, 5);
+  const text = (cand?.content?.parts || []).map((p) => p.text || '').join('').trim();
+  if (!text) return { reply: '', places: [], sources, finish: cand?.finishReason || 'EMPTY' };
+
+  // If response is wrapped in ```json ... ```
+  let cleanText = text;
+  const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (jsonMatch) cleanText = jsonMatch[1].trim();
+
+  let replyStr = '';
+  let extractedPlaces = [];
+
+  try {
+    const out = JSON.parse(cleanText);
+    if (out && typeof out === 'object' && out.reply) {
+      replyStr = String(out.reply || '').trim();
+      extractedPlaces = Array.isArray(out.places) ? out.places : [];
+    }
+  } catch {}
+
+  if (!replyStr) {
+    const sal = salvage(text);
+    replyStr = sal && sal.length > 3 ? sal.trim() : text.trim();
+  }
+
+  // If places array is empty, match from places catalog by id or name
+  if (!extractedPlaces.length && placesCatalog.length && replyStr) {
+    const lower = replyStr.toLowerCase();
+    for (const p of placesCatalog) {
+      if (!p.id || !p.name) continue;
+      if (lower.includes(p.name.toLowerCase()) || lower.includes(p.id.toLowerCase())) {
+        extractedPlaces.push(p.id);
+        if (extractedPlaces.length >= 2) break;
+      }
+    }
+  }
+
+  return { reply: cleanReplyText(replyStr), places: extractedPlaces, sources, finish: cand?.finishReason, groundingQueries: grounding.webSearchQueries || [] };
+}
+
+function readGroqReply(raw) {
+  const data = JSON.parse(raw);
+  const text = data.choices?.[0]?.message?.content || '';
+  return readReply(JSON.stringify({ candidates: [{ content: { parts: [{ text }] } }] }));
+}
+
+function json(res, code, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(payload) });
+  res.end(payload);
+}
+
+function readBody(req, limit = 256 * 1024) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limit) {
+        reject(new Error('Request body too large.'));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+async function chat(req, res) {
+  if (!GROQ_API_KEY && (!GEMINI_API_KEY || GEMINI_API_KEY === 'SET_GEMINI_KEY_IN_RENDER_ENV')) {
+    return json(res, 503, { error: 'No AI provider is configured. Add GROQ_API_KEY or GEMINI_API_KEY in the deployment environment.' });
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, 400, { error: `Could not read the request: ${err.message}` });
+  }
+
+  const rawTurns = Array.isArray(payload.turns) 
+    ? payload.turns.slice(-30) 
+    : Array.isArray(payload.messages) 
+      ? payload.messages.slice(-30) 
+      : [];
+  if (!rawTurns.length) return json(res, 400, { error: 'No conversation turns were sent.' });
+
+  // Sanitize turns so Gemini API rules are strictly satisfied:
+  // 1. Must alternate: user, model, user, model...
+  // 2. Must start with 'user'
+  const sanitizedContents = [];
+  for (const t of rawTurns) {
+    const text = String(t.text || '').trim();
+    if (!text) continue;
+    const role = t.role === 'model' || t.role === 'bot' ? 'model' : 'user';
+
+    if (sanitizedContents.length === 0) {
+      if (role === 'model') continue; // First turn must be user
+      sanitizedContents.push({ role: 'user', parts: [{ text: text.slice(0, 4000) }] });
+    } else {
+      const prev = sanitizedContents[sanitizedContents.length - 1];
+      if (prev.role === role) {
+        // Merge consecutive turns with the same role
+        prev.parts[0].text += '\n\n' + text.slice(0, 4000);
+      } else {
+        sanitizedContents.push({ role, parts: [{ text: text.slice(0, 4000) }] });
+      }
+    }
+  }
+
+  // Ensure at least one user turn
+  if (!sanitizedContents.length) {
+    sanitizedContents.push({ role: 'user', parts: [{ text: 'Hello, please recommend top destinations and foods in Bangladesh.' }] });
+  }
+
+  const now = new Date();
+  const currentDateStr = now.toLocaleDateString('en-US', {
+    weekday: 'long',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+  });
+  const isoDate = now.toISOString().split('T')[0];
+
+  const BASE_SYSTEM_INSTRUCTION = `You are Way Bangladesh AI — the premier travel, cultural, and smart life companion for Bangladesh.
+
+REAL-WORLD CURRENT DATE & LIVE SEARCH:
+- TODAY'S REAL-WORLD DATE IS: ${currentDateStr} (${isoDate}).
+- YOU ARE OPERATING IN THE PRESENT YEAR 2026. NEVER claim you are in 2024 or that 2026 is in the future!
+- LIVE WEB SEARCH IS ALWAYS REQUIRED for travel, weather, prices, transport, visa, opening hours, current events, and any factual claim about Bangladesh or destinations. Use Google Search grounding for every factual answer whenever possible.
+- Never pretend to have checked the web if you have not. If a fact is not verified from live web sources, label it clearly as "General travel guidance (not live-verified)" and do not present it as current fact.
+- Do not include URLs, markdown links, a "Sources" heading, or a "Clickable Sources" section inside your reply. The app automatically adds verified clickable source links below your answer.
+
+REPLY STRUCTURE (MANDATORY):
+- Start with a short, warm answer in plain traveler language.
+- Then give 2 to 4 bullet points or short sections.
+- End with a final section called: "Verified web findings" if the answer used live web data; otherwise "General guidance (not live-verified)".
+- In the final section, state exactly what you verified from the web and what remains general advice.
+- If you cannot verify a fact from live web sources, say: "I could not verify this with live web sources, so I am treating it as general guidance rather than a confirmed fact."
+
+REPLY LENGTH DIRECTIVE (MEDIUM LENGTH ONLY - CRITICAL):
+- Do NOT make your replies too long (no giant walls of text or exhaustive essays).
+- Do NOT make your replies too small (no 1-line dismissive answers).
+- ALWAYS provide a balanced, MEDIUM-length reply (approx 100 to 220 words, or 2 to 4 crisp sections/bullet points).
+- Keep every answer neat, punchy, informative, and easily readable on mobile.
+
+KAOMOJI DIRECTIVE (MANDATORY IN EVERY LINE/POINT):
+- You MUST use lots of expressive, cute kaomojis throughout your reply!
+- Include at least one expressive kaomoji on almost EVERY line, sentence, or bullet point!
+- Use a rich, lively variety of kaomojis to bring warmth and excitement, such as:
+  (✿◠‿◠), (★ω★), (｡♥‿♥｡), (づ｡◕‿‿◕｡)づ, (≧◡≦), ( ˘▽˘)っ♨, (*^▽^*), (´｡• ᵕ •｡), (ﾉ◕ヮ◕)ﾉ*:･ﾟ✧,
+  (•̀ᴗ•́)و, (ง'-'́)ง, (｡•́︿•̀｡), (´･_･), ヽ(>∀<☆)ノ, (o˘◡˘o), (⌒‿⌒), (＾▽＾), ٩(◕‿◕｡)۶
+- Every major greeting, thought, fact, and conclusion must feature kaomojis!
+
+FACT-VERIFICATION RULES:
+- Quote or summarize only what was found from live web search results.
+- Distinguish clearly between: verified web facts, general travel advice, and uncertainty.
+- Do not invent travel details, prices, hours, rules, or event info if you have not verified them live.
+- If a claim is uncertain or likely stale, say so explicitly.
+
+KNOWLEDGE SCOPE:
+- Speak with warmth, authentic local knowledge, cultural respect, and safety-conscious precision.
+- Provide recommendations across all 64 districts of Bangladesh (Dhaka, Chittagong, Sylhet, Cox's Bazar, Sundarbans, Bandarban, Sreemangal, Rajshahi, Rangpur, Barisal, Mymensingh, etc.), covering destinations, transport, food, heritage, customs, seasons, and itineraries.`;
+
+  const safeSystemPrompt = payload.systemPrompt
+    ? `${BASE_SYSTEM_INSTRUCTION}\n\nClient Context & Catalog:\n${String(payload.systemPrompt).slice(0, 3000)}`
+    : BASE_SYSTEM_INSTRUCTION;
+
+  const body = {
+    contents: sanitizedContents,
+    generationConfig: {
+      temperature: 0.75,
+      topP: 0.95,
+      maxOutputTokens: 1200,
+    },
+    systemInstruction: { parts: [{ text: safeSystemPrompt }] },
+  };
+
+  const requestText = sanitizedContents.map((turn) => turn.parts.map((part) => part.text).join(' ')).join(' ');
+  const needsWebSearch = /\b(search|web|latest|current|today|news|weather|visa|price|schedule|opening hours|recent|2026)\b/i.test(requestText);
+
+  // Product behavior: Groq is the main provider for everyday answers. If it is
+  // rate-limited, down, or fails, Gemini automatically takes over as fallback.
+  if (GROQ_API_KEY) {
+    try {
+      const groqMessages = [
+        { role: 'system', content: `${safeSystemPrompt}\nReturn only valid json with this shape: {"reply":"...","places":[]}.` },
+        ...sanitizedContents.map((turn) => ({
+          role: turn.role === 'model' ? 'assistant' : 'user',
+          content: turn.parts.map((part) => part.text).join('\n'),
+        })),
+      ];
+      const groqResponse = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: groqMessages,
+          temperature: 0.75,
+          max_tokens: 1200,
+          response_format: { type: 'json_object' },
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+      const groqRaw = await groqResponse.text();
+      if (groqResponse.ok) {
+        const out = readGroqReply(groqRaw);
+        if (out.reply) return json(res, 200, { reply: out.reply, places: out.places.slice(0, 2), sources: [] });
+      } else if (process.env.NODE_ENV !== 'production') {
+        console.error(`[chat] Groq ${groqResponse.status}: ${groqRaw.slice(0, 240)}`);
+      }
+    } catch (err) {
+      if (process.env.NODE_ENV !== 'production') console.error(`[chat] Groq unavailable: ${err.message}`);
+    }
+  }
+
+  const key = GEMINI_API_KEY || '';
+  if (!key || key === 'SET_GEMINI_KEY_IN_RENDER_ENV') {
+    return json(res, 503, { error: 'Groq was unavailable and GEMINI_API_KEY is not configured for fallback.' });
+  }
+
+  // Overload, rate limits and empty candidates are all transient, and a chat
+  // bubble that says "502" is useless to a traveller — work down the models
+  // before giving up.
+  let last = 'Gemini did not answer.';
+  const deadline = Date.now() + 90000;
+  const uniqueModels = [...new Set(MODELS)];
+  for (let attempt = 0; attempt < uniqueModels.length; attempt += 1) {
+    if (attempt) await new Promise((r) => setTimeout(r, 800));
+    if (Date.now() > deadline) break;
+    const model = uniqueModels[attempt];
+    const tc = thinkingFor(model);
+    // Force web grounding for every travel answer so the assistant behaves like
+    // a reliable travel product instead of a memory-only chatbot.
+    body.tools = [{ google_search: {} }];
+    if (tc) {
+      body.generationConfig.thinkingConfig = tc;
+    } else {
+      delete body.generationConfig.thinkingConfig;
+    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    let upstream;
+    try {
+      upstream = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(body),
+        // Cap each try so a slow model still leaves room for the next one.
+        signal: AbortSignal.timeout(Math.max(5000, Math.min(25000, deadline - Date.now()))),
+      });
+    } catch (err) {
+      last =
+        err.name === 'TimeoutError' || /timeout/i.test(err.message)
+          ? 'That answer is taking longer than usual — ask me once more?'
+          : `Could not reach Gemini: ${err.message}`;
+      continue;
+    }
+
+    const raw = await upstream.text();
+    if (!upstream.ok) {
+      let message = raw.slice(0, 300);
+      try {
+        message = JSON.parse(raw).error?.message || message;
+      } catch {
+        /* keep the raw snippet */
+      }
+      if (process.env.NODE_ENV !== 'production') console.error(`[chat] ${model} ${upstream.status}: ${message.split('\n')[0]}`);
+      last =
+        upstream.status === 429
+          ? 'The Gemini key has run out of free quota for now — try again in a minute.'
+          : `Gemini said: ${message}`;
+      if (upstream.status === 429 && !needsWebSearch) break;
+      if (upstream.status < 500 && upstream.status !== 429 && upstream.status !== 404) break;
+      continue;
+    }
+
+    let out;
+    try {
+      out = readReply(raw);
+    } catch {
+      last = 'Gemini sent something I could not read.';
+      continue;
+    }
+    if (!out.reply) {
+      if (process.env.NODE_ENV !== 'production') console.error(`[chat] ${model} empty candidate (finishReason ${out.finish})`);
+      last = 'Gemini sent an empty reply.';
+      continue;
+    }
+    if (needsWebSearch && !out.sources.length && attempt < uniqueModels.length - 1) continue;
+    return json(res, 200, { reply: out.reply, places: out.places.slice(0, 2), sources: out.sources });
+  }
+
+  // All models failed - return error so client shows proper error message
+  return json(res, 503, { error: last || 'AI service temporarily unavailable. Please try again in a moment.' });
+}
+
+const TRANSLATE_CACHE = new Map();
+
+async function translate(req, res) {
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (err) {
+    return json(res, 400, { error: `Could not read the request: ${err.message}` });
+  }
+
+  const { text, from = 'en', to = 'bn' } = payload;
+  if (!text || !text.trim()) return json(res, 400, { error: 'Text to translate is required.' });
+
+  const cleanText = text.trim();
+  const cacheKey = `${from}:${to}:${cleanText.toLowerCase()}`;
+  if (TRANSLATE_CACHE.has(cacheKey)) {
+    return json(res, 200, TRANSLATE_CACHE.get(cacheKey));
+  }
+
+  if (from === to) {
+    return json(res, 200, { translatedText: cleanText, pronunciation: '' });
+  }
+
+  const key = GEMINI_API_KEY || "";
+  let last = 'Translation failed.';
+
+  if (key) {
+    const prompt = `Translate the following text accurately from ${from} to ${to} for a traveler visiting Bangladesh.
+Source Text: "${cleanText}"
+
+Respond in JSON format:
+{
+  "translatedText": "natural translation in target language",
+  "pronunciation": "transliterated phonetic pronunciation in English alphabet if target is Bangla/Sylheti/Chittagonian"
+}`;
+
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
+        topP: 0.8,
+        maxOutputTokens: 350,
+        thinkingConfig: { thinkingBudget: 0 },
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: 'object',
+          properties: {
+            translatedText: { type: 'string' },
+            pronunciation: { type: 'string' },
+          },
+          required: ['translatedText'],
+        },
+      },
+    };
+
+    for (let attempt = 0; attempt < MODELS.length; attempt += 1) {
+      const model = MODELS[attempt];
+      if (model.startsWith('gemini-3')) {
+        body.generationConfig.thinkingConfig = { thinkingBudget: 0 };
+      } else {
+        delete body.generationConfig.thinkingConfig;
+      }
+
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+      try {
+        const upstream = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!upstream.ok) continue;
+        const raw = await upstream.text();
+        const data = JSON.parse(raw);
+        const resText = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
+        const parsed = JSON.parse(resText);
+        if (parsed && parsed.translatedText) {
+          const resultObj = {
+            translatedText: parsed.translatedText || '',
+            pronunciation: parsed.pronunciation || '',
+          };
+          if (TRANSLATE_CACHE.size > 2000) {
+            const firstKey = TRANSLATE_CACHE.keys().next().value;
+            TRANSLATE_CACHE.delete(firstKey);
+          }
+          TRANSLATE_CACHE.set(cacheKey, resultObj);
+          return json(res, 200, resultObj);
+        }
+      } catch (e) {
+        last = e.message;
+      }
+    }
+  }
+
+  // Resilient Fallback: MyMemory Translation API
+  try {
+    const pair = `${from.slice(0, 2)}|${to.slice(0, 2)}`;
+    const mmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(cleanText)}&langpair=${encodeURIComponent(pair)}`;
+    const mmRes = await fetch(mmUrl, { signal: AbortSignal.timeout(6000) });
+    if (mmRes.ok) {
+      const mmData = await mmRes.json();
+      if (mmData && mmData.responseData && mmData.responseData.translatedText) {
+        const tr = mmData.responseData.translatedText.trim();
+        if (!tr.toUpperCase().includes('MYMEMORY WARNING') && tr.length > 0) {
+          const resultObj = {
+            translatedText: tr,
+            pronunciation: '',
+          };
+          TRANSLATE_CACHE.set(cacheKey, resultObj);
+          return json(res, 200, resultObj);
+        }
+      }
+    }
+  } catch (e) {
+    last = e.message;
+  }
+
+  return json(res, 502, { error: last });
+}
+
+async function tts(req, res) {
+  const urlObj = new URL(req.url, 'http://localhost');
+  const text = (urlObj.searchParams.get('text') || '').trim().slice(0, 300);
+  const lang = (urlObj.searchParams.get('lang') || 'bn').toLowerCase();
+
+  if (!text) {
+    return json(res, 400, { error: 'No text provided.' });
+  }
+
+  let ttsLang = 'bn';
+  if (lang === 'bn' || lang === 'syl' || lang === 'ctg') {
+    ttsLang = 'bn';
+  } else if (lang === 'en') {
+    ttsLang = 'en';
+  } else if (lang === 'es') {
+    ttsLang = 'es';
+  } else if (lang === 'hi') {
+    ttsLang = 'hi';
+  } else if (lang === 'ar') {
+    ttsLang = 'ar';
+  } else if (lang === 'fr') {
+    ttsLang = 'fr';
+  } else if (lang === 'ja') {
+    ttsLang = 'ja';
+  } else if (lang === 'de') {
+    ttsLang = 'de';
+  } else {
+    ttsLang = lang;
+  }
+
+  const googleTtsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(text)}&tl=${encodeURIComponent(ttsLang)}&client=tw-ob`;
+
+  try {
+    const upstream = await fetch(googleTtsUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Referer': 'https://translate.google.com/',
+      },
+      signal: AbortSignal.timeout(7000),
+    });
+
+    if (!upstream.ok) {
+      return json(res, 502, { error: `TTS service returned status ${upstream.status}` });
+    }
+
+    res.writeHead(200, {
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'public, max-age=86400',
+    });
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    return res.end(buffer);
+  } catch (err) {
+    return json(res, 502, { error: `TTS failed: ${err.message}` });
+  }
+}
+
+async function serveStatic(req, res) {
+  const rel = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+  const file = path.join(ROOT, rel === '/' ? 'index.html' : rel);
+  if (!file.startsWith(ROOT)) return json(res, 403, { error: 'Forbidden' });
+
+  // Security: Block any hidden files, .env, .git, package.json, server.js, start.bat, etc.
+  const base = path.basename(file).toLowerCase();
+  const relLower = rel.toLowerCase();
+  if (
+    base.startsWith('.') ||
+    relLower.includes('/.') ||
+    base === 'package.json' ||
+    base === 'server.js' ||
+    base === 'start.bat' ||
+    base.endsWith('.env')
+  ) {
+    return json(res, 403, { error: 'Forbidden' });
+  }
+
+  let stat;
+  try {
+    stat = await fsp.stat(file);
+  } catch {
+    return json(res, 404, { error: 'Not found' });
+  }
+  if (stat.isDirectory()) return json(res, 404, { error: 'Not found' });
+
+  const type = MIME[path.extname(file).toLowerCase()] || 'application/octet-stream';
+  const range = req.headers.range;
+
+  // Videos need byte ranges for Chrome to scrub and autoplay reliably.
+  if (range && /^bytes=/.test(range)) {
+    const [startRaw, endRaw] = range.replace('bytes=', '').split('-');
+    const start = Number(startRaw) || 0;
+    const end = endRaw ? Math.min(Number(endRaw), stat.size - 1) : stat.size - 1;
+    res.writeHead(206, {
+      'Content-Type': type,
+      'Content-Range': `bytes ${start}-${end}/${stat.size}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': end - start + 1,
+    });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+
+  const shouldRefreshDuringDevelopment = ['.html', '.css', '.js', '.json'].includes(path.extname(file).toLowerCase());
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': stat.size,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': shouldRefreshDuringDevelopment ? 'no-store' : 'public, max-age=3600',
+  });
+  fs.createReadStream(file).pipe(res);
+}
+
+async function serveSpaDist(req, res, distRoot, baseRoute) {
+  let subPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname).slice(baseRoute.length);
+  if (!subPath || subPath === '/') subPath = 'index.html';
+  let targetFile = path.join(distRoot, subPath);
+  if (!targetFile.startsWith(distRoot)) return json(res, 403, { error: 'Forbidden' });
+
+  let stat;
+  try {
+    stat = await fsp.stat(targetFile);
+    if (stat.isDirectory()) {
+      targetFile = path.join(targetFile, 'index.html');
+      stat = await fsp.stat(targetFile);
+    }
+  } catch {
+    // SPA fallback: serve index.html
+    targetFile = path.join(distRoot, 'index.html');
+    try {
+      stat = await fsp.stat(targetFile);
+    } catch {
+      return json(res, 404, { error: 'Application build not found.' });
+    }
+  }
+
+  const type = MIME[path.extname(targetFile).toLowerCase()] || 'application/octet-stream';
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': stat.size,
+    'Cache-Control': targetFile.endsWith('.html') ? 'no-cache' : 'public, max-age=31536000, immutable'
+  });
+  fs.createReadStream(targetFile).pipe(res);
+}
+
+http
+  .createServer((req, res) => {
+    const route = req.url.split('?')[0];
+
+    // Standalone Book App route
+    if (route === '/book') {
+      res.writeHead(302, { Location: '/book/' });
+      return res.end();
+    }
+    if (route.startsWith('/book/')) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Use GET.' });
+      return serveSpaDist(req, res, BOOK_DIST, '/book/').catch((err) => json(res, 500, { error: err.message }));
+    }
+
+    // Standalone Hospital App route
+    if (route === '/hospital') {
+      res.writeHead(302, { Location: '/hospital/' });
+      return res.end();
+    }
+    if (route.startsWith('/hospital/')) {
+      if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Use GET.' });
+      return serveSpaDist(req, res, HOSP_DIST, '/hospital/').catch((err) => json(res, 500, { error: err.message }));
+    }
+
+    if (route === '/api/chat') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'Use POST.' });
+      return chat(req, res).catch((err) => json(res, 500, { error: err.message }));
+    }
+    if (route === '/api/translate') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'Use POST.' });
+      return translate(req, res).catch((err) => json(res, 500, { error: err.message }));
+    }
+    if (route === '/api/tts') {
+      if (req.method !== 'GET') return json(res, 405, { error: 'Use GET.' });
+      return tts(req, res).catch((err) => json(res, 500, { error: err.message }));
+    }
+    if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'Use GET.' });
+    serveStatic(req, res).catch((err) => json(res, 500, { error: err.message }));
+  })
+  .listen(PORT, '0.0.0.0', () => {
+    console.log(`Way Bangladesh on http://0.0.0.0:${PORT}`);
+    if (!process.env.GEMINI_API_KEY && process.env.NODE_ENV !== 'production') console.warn('GEMINI_API_KEY is not set — the chat will return 503.');
+  });
+
+
+
+
+
+
+
