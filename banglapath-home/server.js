@@ -296,7 +296,7 @@ KNOWLEDGE SCOPE:
   };
 
   const requestText = sanitizedContents.map((turn) => turn.parts.map((part) => part.text).join(' ')).join(' ');
-  const needsWebSearch = /\b(search|web|latest|current|today|news|weather|visa|price|schedule|opening hours|recent|2026)\b/i.test(requestText);
+  const needsWebSearch = Boolean(payload.webSearch) || /\b(search|web|latest|current|today|news|weather|visa|price|schedule|opening hours|recent|2026)\b/i.test(requestText);
 
   // Product behavior: Groq is the main provider for everyday answers. If it is
   // rate-limited, down, or fails, Gemini automatically takes over as fallback.

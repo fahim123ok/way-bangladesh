@@ -567,7 +567,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
 
   /* ---------------- Gemini transport ---------------- */
 
-  function buildRequest(turns) {
+  function buildRequest(turns, webSearch = false) {
     return {
       systemInstruction: { parts: [{ text: systemPrompt() }] },
       contents: turns.map((t) => ({ role: t.role === 'user' ? 'user' : 'model', parts: [{ text: t.text }] })),
@@ -580,6 +580,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
         responseMimeType: 'application/json',
         responseSchema: RESPONSE_SCHEMA,
       },
+      ...(webSearch ? { tools: [{ google_search: {} }] } : {}),
     };
   }
 
@@ -614,15 +615,15 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     return { reply: String(data.reply || '').trim(), places: [...new Set(ids)].slice(0, 2), sources };
   }
 
-  async function askGemini(turns) {
-    const body = buildRequest(turns);
+  async function askGemini(turns, { webSearch = false } = {}) {
+    const body = buildRequest(turns, webSearch);
 
     // Preferred path: the bundled Node proxy keeps the API key off the client.
     try {
       const res = await fetchWithRetry(PROXY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text }),
+        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text, webSearch }),
       });
       if (res.ok) {
         const data = await res.json();
@@ -828,7 +829,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     return null;
   }
 
-  async function send(text, { display = text } = {}) {
+  async function send(text, { display = text, webSearch = false } = {}) {
     if (!text.trim()) return;
     if (busy) {
       showToast('I am still answering the previous question. Your pin will be next...');
@@ -847,7 +848,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     }, 20000);
 
     try {
-      const { reply, places, sources } = await askGemini(history.slice(-30));
+      const { reply, places, sources } = await askGemini(history.slice(-30), { webSearch });
       clearTimeout(busyTimer);
       typing.remove();
       addMessage('bot', reply, sources);
@@ -7929,6 +7930,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     $('#chat-form').addEventListener('submit', (e) => {
       e.preventDefault();
       const input = $('#chat-text');
+      const webSearch = $('#chat-web-search')?.classList.contains('is-active') || false;
       const text = input.value.trim();
 
       // Input validation
@@ -7943,7 +7945,14 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
       }
 
       input.value = '';
-      send(text);
+      send(text, { webSearch });
+    });
+
+    $('#chat-web-search')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      const active = button.classList.toggle('is-active');
+      button.setAttribute('aria-pressed', String(active));
+      button.setAttribute('title', active ? 'Web search is on' : 'Use web search');
     });
 
     // Add input validation feedback
