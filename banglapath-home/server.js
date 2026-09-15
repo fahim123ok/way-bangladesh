@@ -281,22 +281,25 @@ KNOWLEDGE SCOPE:
 - Speak with warmth, authentic local knowledge, cultural respect, and safety-conscious precision.
 - Provide recommendations across all 64 districts of Bangladesh (Dhaka, Chittagong, Sylhet, Cox's Bazar, Sundarbans, Bandarban, Sreemangal, Rajshahi, Rangpur, Barisal, Mymensingh, etc.), covering destinations, transport, food, heritage, customs, seasons, and itineraries.`;
 
-  const safeSystemPrompt = payload.systemPrompt
-    ? `${BASE_SYSTEM_INSTRUCTION}\n\nClient Context & Catalog:\n${String(payload.systemPrompt).slice(0, 3000)}`
-    : BASE_SYSTEM_INSTRUCTION;
+  const safeSystemPrompt = `You are Bangladesh speaking directly to a traveller.
+Be warm, outgoing, curious, playful, and helpful. Use a few cute kaomojis such as (✿◠‿◠), (★ω★), or (づ｡◕‿‿◕｡)づ.
+Help visitors become curious about Bangladesh, its places, food, culture, people, and travel experiences.
+Answer in the traveller's language, keep replies short and natural, and do not invent current facts.
+When the traveller asks about a place, explain what makes it special and give one practical tip.
+You are a simple conversational guide. Reply with plain text only.`;
 
   const body = {
     contents: sanitizedContents,
     generationConfig: {
       temperature: 0.75,
       topP: 0.95,
-      maxOutputTokens: 1200,
+      maxOutputTokens: 500,
     },
     systemInstruction: { parts: [{ text: safeSystemPrompt }] },
   };
 
   const requestText = sanitizedContents.map((turn) => turn.parts.map((part) => part.text).join(' ')).join(' ');
-  const needsWebSearch = Boolean(payload.webSearch) || /\b(search|web|latest|current|today|news|weather|visa|price|schedule|opening hours|recent|2026)\b/i.test(requestText);
+  const needsWebSearch = false;
 
   // Product behavior: Groq is the main provider for everyday answers. If it is
   // rate-limited, down, or fails, Gemini automatically takes over as fallback.
@@ -319,14 +322,13 @@ KNOWLEDGE SCOPE:
           messages: groqMessages,
           temperature: 0.75,
           max_tokens: 1200,
-          response_format: { type: 'json_object' },
         }),
         signal: AbortSignal.timeout(25000),
       });
       const groqRaw = await groqResponse.text();
       if (groqResponse.ok) {
         const out = readGroqReply(groqRaw);
-        if (out.reply) return json(res, 200, { reply: out.reply, places: out.places.slice(0, 2), sources: [] });
+        if (out.reply) return json(res, 200, { reply: out.reply, places: [], sources: [], provider: 'groq' });
         groqFailure = 'Groq returned an empty reply.';
       } else {
         groqQuotaLimited = isQuotaFailure(groqResponse.status, groqRaw);
@@ -364,9 +366,7 @@ KNOWLEDGE SCOPE:
     if (Date.now() > deadline) break;
     const model = uniqueModels[attempt];
     const tc = thinkingFor(model);
-    // Force web grounding for every travel answer so the assistant behaves like
-    // a reliable travel product instead of a memory-only chatbot.
-    body.tools = [{ google_search: {} }];
+    delete body.tools;
     if (tc) {
       body.generationConfig.thinkingConfig = tc;
     } else {
@@ -422,8 +422,7 @@ KNOWLEDGE SCOPE:
       last = 'Gemini sent an empty reply.';
       continue;
     }
-    if (needsWebSearch && !out.sources.length && attempt < uniqueModels.length - 1) continue;
-    return json(res, 200, { reply: out.reply, places: out.places.slice(0, 2), sources: out.sources });
+    return json(res, 200, { reply: out.reply, places: [], sources: [], provider: 'gemini' });
   }
 
   // All models failed - return error so client shows proper error message

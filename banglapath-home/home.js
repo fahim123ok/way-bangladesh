@@ -567,20 +567,17 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
 
   /* ---------------- Gemini transport ---------------- */
 
-  function buildRequest(turns, webSearch = false) {
+  const SIMPLE_CHAT_PROMPT = 'You are Bangladesh speaking directly to a traveller. Be warm, outgoing, curious, playful, and helpful. Use a few cute kaomojis such as (✿◠‿◠), (★ω★), and (づ｡◕‿‿◕｡)づ. Help visitors become curious about Bangladesh, its places, food, culture, people, and travel experiences. Answer in the traveller\'s language, keep replies short and natural, and do not invent current facts. When asked about a place, explain what makes it special and give one practical tip. Reply with plain text only.';
+
+  function buildRequest(turns) {
     return {
-      systemInstruction: { parts: [{ text: systemPrompt() }] },
+      systemInstruction: { parts: [{ text: SIMPLE_CHAT_PROMPT }] },
       contents: turns.map((t) => ({ role: t.role === 'user' ? 'user' : 'model', parts: [{ text: t.text }] })),
       generationConfig: {
         temperature: 0.9,
         topP: 0.95,
-        maxOutputTokens: 2400,
-        // Otherwise thinking tokens eat the budget and the reply comes back empty.
-        thinkingConfig: MODEL.startsWith('gemini-3') ? { thinkingLevel: 'low' } : { thinkingBudget: 512 },
-        responseMimeType: 'application/json',
-        responseSchema: RESPONSE_SCHEMA,
+        maxOutputTokens: 500,
       },
-      ...(webSearch ? { tools: [{ google_search: {} }] } : {}),
     };
   }
 
@@ -599,38 +596,25 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
   function parsePayload(raw) {
     const text = (raw?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
     if (!text) throw new Error('Empty response from the model.');
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { reply: salvage(text), places: [] };
-    }
-    const ids = Array.isArray(data.places) ? data.places.filter((id) => byId.has(id)) : [];
-    const sources = (raw?.groundingMetadata?.groundingChunks || [])
-      .map((chunk) => chunk.web)
-      .filter((web) => web && /^https?:\/\//i.test(web.uri || ''))
-      .map((web) => ({ title: String(web.title || web.uri), uri: web.uri }))
-      .filter((source, index, all) => all.findIndex((item) => item.uri === source.uri) === index)
-      .slice(0, 5);
-    return { reply: String(data.reply || '').trim(), places: [...new Set(ids)].slice(0, 2), sources };
+    return { reply: text, places: [], sources: [] };
   }
 
-  async function askGemini(turns, { webSearch = false } = {}) {
-    const body = buildRequest(turns, webSearch);
+  async function askGemini(turns) {
+    const body = buildRequest(turns);
 
     // Preferred path: the bundled Node proxy keeps the API key off the client.
     try {
       const res = await fetchWithRetry(PROXY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text, webSearch }),
+        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text }),
       });
       if (res.ok) {
         const data = await res.json();
         if (data.error) throw new Error(data.error);
         const reply = String(data.reply || '').trim();
         if (!reply) throw new Error('The guide sent an empty reply.');
-        return { reply, places: (data.places || []).filter((id) => byId.has(id)).slice(0, 2), sources: data.sources || [] };
+        return { reply, places: [], sources: [] };
       }
       if (res.status !== 404) {
         // The proxy explains itself (quota, upstream timeout) — say that, not a status code.
@@ -829,7 +813,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     return null;
   }
 
-  async function send(text, { display = text, webSearch = false } = {}) {
+  async function send(text, { display = text } = {}) {
     if (!text.trim()) return;
     if (busy) {
       showToast('I am still answering the previous question. Your pin will be next...');
@@ -848,12 +832,12 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     }, 20000);
 
     try {
-      const { reply, places, sources } = await askGemini(history.slice(-30), { webSearch });
+      const { reply } = await askGemini(history.slice(-10));
       clearTimeout(busyTimer);
       typing.remove();
-      addMessage('bot', reply, sources);
+      addMessage('bot', reply);
       history.push({ role: 'model', text: reply });
-      renderSuggestions(places);
+      renderSuggestions([]);
     } catch (err) {
       clearTimeout(busyTimer);
       typing.remove();
@@ -7930,7 +7914,6 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     $('#chat-form').addEventListener('submit', (e) => {
       e.preventDefault();
       const input = $('#chat-text');
-      const webSearch = $('#chat-web-search')?.classList.contains('is-active') || false;
       const text = input.value.trim();
 
       // Input validation
@@ -7945,14 +7928,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
       }
 
       input.value = '';
-      send(text, { webSearch });
-    });
-
-    $('#chat-web-search')?.addEventListener('click', (event) => {
-      const button = event.currentTarget;
-      const active = button.classList.toggle('is-active');
-      button.setAttribute('aria-pressed', String(active));
-      button.setAttribute('title', active ? 'Web search is on' : 'Use web search');
+      send(text);
     });
 
     // Add input validation feedback
