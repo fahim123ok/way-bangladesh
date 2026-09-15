@@ -569,7 +569,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
 
   const SIMPLE_CHAT_PROMPT = 'You are Bangladesh speaking directly to a traveller. Be warm, outgoing, curious, playful, and helpful. Use a few cute kaomojis such as (✿◠‿◠), (★ω★), and (づ｡◕‿‿◕｡)づ. Help visitors become curious about Bangladesh, its places, food, culture, people, and travel experiences. Answer in the traveller\'s language, keep replies short and natural, and do not invent current facts. When asked about a place, explain what makes it special and give one practical tip. Reply with plain text only.';
 
-  function buildRequest(turns) {
+  function buildRequest(turns, webSearch = false) {
     return {
       systemInstruction: { parts: [{ text: SIMPLE_CHAT_PROMPT }] },
       contents: turns.map((t) => ({ role: t.role === 'user' ? 'user' : 'model', parts: [{ text: t.text }] })),
@@ -578,6 +578,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
         topP: 0.95,
         maxOutputTokens: 500,
       },
+      ...(webSearch ? { tools: [{ google_search: {} }] } : {}),
     };
   }
 
@@ -596,25 +597,31 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
   function parsePayload(raw) {
     const text = (raw?.candidates?.[0]?.content?.parts || []).map((p) => p.text || '').join('').trim();
     if (!text) throw new Error('Empty response from the model.');
-    return { reply: text, places: [], sources: [] };
+    const sources = (raw?.groundingMetadata?.groundingChunks || [])
+      .map((chunk) => chunk.web)
+      .filter((web) => web && /^https?:\/\//i.test(web.uri || ''))
+      .map((web) => ({ title: String(web.title || web.uri), uri: web.uri }))
+      .filter((source, index, all) => all.findIndex((item) => item.uri === source.uri) === index)
+      .slice(0, 5);
+    return { reply: text, places: [], sources };
   }
 
-  async function askGemini(turns) {
-    const body = buildRequest(turns);
+  async function askGemini(turns, { webSearch = false } = {}) {
+    const body = buildRequest(turns, webSearch);
 
     // Preferred path: the bundled Node proxy keeps the API key off the client.
     try {
       const res = await fetchWithRetry(PROXY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text }),
+        body: JSON.stringify({ turns, systemPrompt: body.systemInstruction.parts[0].text, webSearch }),
       });
       if (res.ok) {
         const data = await res.json();
         if (data.error) throw new Error(data.error);
         const reply = String(data.reply || '').trim();
         if (!reply) throw new Error('The guide sent an empty reply.');
-        return { reply, places: [], sources: [] };
+        return { reply, places: [], sources: data.sources || [] };
       }
       if (res.status !== 404) {
         // The proxy explains itself (quota, upstream timeout) — say that, not a status code.
@@ -813,7 +820,7 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     return null;
   }
 
-  async function send(text, { display = text } = {}) {
+  async function send(text, { display = text, webSearch = false } = {}) {
     if (!text.trim()) return;
     if (busy) {
       showToast('I am still answering the previous question. Your pin will be next...');
@@ -832,10 +839,10 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     }, 20000);
 
     try {
-      const { reply } = await askGemini(history.slice(-10));
+      const { reply, sources } = await askGemini(history.slice(-10), { webSearch });
       clearTimeout(busyTimer);
       typing.remove();
-      addMessage('bot', reply);
+      addMessage('bot', reply, webSearch ? sources : []);
       history.push({ role: 'model', text: reply });
       renderSuggestions([]);
     } catch (err) {
@@ -7914,6 +7921,8 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
     $('#chat-form').addEventListener('submit', (e) => {
       e.preventDefault();
       const input = $('#chat-text');
+      const webSearchButton = $('#chat-web-search');
+      const webSearch = webSearchButton?.classList.contains('is-active') || false;
       const text = input.value.trim();
 
       // Input validation
@@ -7928,7 +7937,17 @@ Reply as JSON: {"reply": "...", "places": ["id"]}`;
       }
 
       input.value = '';
-      send(text);
+      webSearchButton?.classList.remove('is-active');
+      webSearchButton?.setAttribute('aria-pressed', 'false');
+      webSearchButton?.setAttribute('title', 'Use web search');
+      send(text, { webSearch });
+    });
+
+    $('#chat-web-search')?.addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      const active = button.classList.toggle('is-active');
+      button.setAttribute('aria-pressed', String(active));
+      button.setAttribute('title', active ? 'Web search will be used for the next message' : 'Use web search');
     });
 
     // Add input validation feedback

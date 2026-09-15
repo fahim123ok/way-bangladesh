@@ -288,6 +288,7 @@ Answer in the traveller's language, keep replies short and natural, and do not i
 When the traveller asks about a place, explain what makes it special and give one practical tip.
 You are a simple conversational guide. Reply with plain text only.`;
 
+  const needsWebSearch = Boolean(payload.webSearch);
   const body = {
     contents: sanitizedContents,
     generationConfig: {
@@ -299,16 +300,14 @@ You are a simple conversational guide. Reply with plain text only.`;
   };
 
   const requestText = sanitizedContents.map((turn) => turn.parts.map((part) => part.text).join(' ')).join(' ');
-  const needsWebSearch = false;
-
   // Product behavior: Groq is the main provider for everyday answers. If it is
   // rate-limited, down, or fails, Gemini automatically takes over as fallback.
   let groqFailure = '';
   let groqQuotaLimited = false;
-  if (GROQ_API_KEY) {
+  if (GROQ_API_KEY && !needsWebSearch) {
     try {
       const groqMessages = [
-        { role: 'system', content: `${safeSystemPrompt}\nReturn only valid json with this shape: {"reply":"...","places":[]}.` },
+        { role: 'system', content: `${safeSystemPrompt}\nReturn plain text only.` },
         ...sanitizedContents.map((turn) => ({
           role: turn.role === 'model' ? 'assistant' : 'user',
           content: turn.parts.map((part) => part.text).join('\n'),
@@ -366,7 +365,11 @@ You are a simple conversational guide. Reply with plain text only.`;
     if (Date.now() > deadline) break;
     const model = uniqueModels[attempt];
     const tc = thinkingFor(model);
-    delete body.tools;
+    if (needsWebSearch) {
+      body.tools = [{ google_search: {} }];
+    } else {
+      delete body.tools;
+    }
     if (tc) {
       body.generationConfig.thinkingConfig = tc;
     } else {
@@ -422,7 +425,7 @@ You are a simple conversational guide. Reply with plain text only.`;
       last = 'Gemini sent an empty reply.';
       continue;
     }
-    return json(res, 200, { reply: out.reply, places: [], sources: [], provider: 'gemini' });
+    return json(res, 200, { reply: out.reply, places: [], sources: needsWebSearch ? out.sources : [], provider: 'gemini' });
   }
 
   // All models failed - return error so client shows proper error message
